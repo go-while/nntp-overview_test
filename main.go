@@ -16,32 +16,42 @@ var (
     NUM_CPUS int = 2
     DEBUG bool = true
     OVERVIEW_WORKERS int = 8
-    OVERVIEW_QUEUE int = OVERVIEW_WORKERS*2
+    OVERVIEW_QUEUE int = OVERVIEW_WORKERS
     MAX_OPEN_MMAPS int = 500
     MAX_KNOWN_MESSAGEIDS = 100
     OV_OPENER int = OVERVIEW_WORKERS
-    OV_CLOSER int = OVERVIEW_WORKERS*2
+    OV_CLOSER int = OVERVIEW_WORKERS+1
     OVERVIEW_DIR string = "test_overview"
 
     stop_server_chan = make(chan bool, 1)       // used to signal that server is stopping
-    overview_input_channel chan overview.OVL    // gets assigned by Load_Overview() later
+    // removed 'overview_input_channel', use module channel directly: 'overview.Overview.OVIC'
+
+    // debugs
+    uniq_date_chan chan int64
 )
 
 
 func main() {
+    uniq_date_chan = make(chan int64, 1)
+    uniq_date_chan <- int64(68222013)
+
     start_time := utils.Now()
     runtime.GOMAXPROCS(NUM_CPUS)
     rand.Seed(1) // predictable random
     debug_ov_handler := DEBUG // || DEBUG
-    overview_input_channel = overview.Load_Overview(OVERVIEW_WORKERS, OVERVIEW_QUEUE, MAX_OPEN_MMAPS, MAX_KNOWN_MESSAGEIDS, OV_OPENER, OV_CLOSER, stop_server_chan, debug_ov_handler)
-    if overview_input_channel == nil {
-        log.Printf("ERROR overview.Load_Overview returned nil channel")
+    close_always := false
+    more_parallel := false
+    if !overview.Overview.Load_Overview(OVERVIEW_WORKERS, OVERVIEW_QUEUE, MAX_OPEN_MMAPS, MAX_KNOWN_MESSAGEIDS, OV_OPENER, OV_CLOSER, close_always, more_parallel, stop_server_chan, debug_ov_handler) {
+        os.Exit(1)
+    }
+    if overview.Overview.OVIC == nil {
+        log.Printf("ERROR overview.Load_Overview.Overview_input_channel = nil")
         os.Exit(1)
     }
 
-    test_max := 100           // generate this many articles per run, higher max will only flood memory with headers
-    parallel := 10              // runs 'N' GO_main_test in parallel
-    test := parallel*test_max     // generate this many articles to test creating overviews per go routine
+    test_max := 10000     // generate this many articles per run, higher max will only flood memory with headers
+    parallel := 10      // runs 'N' GO_main_test in parallel
+    test := 100000        // generate this many articles to test creating overviews per go routine
 
     main_done := make(chan bool, parallel)
     counter_chan := make(chan uint64, parallel)
@@ -75,8 +85,8 @@ func main() {
                 } else
                 if !ok { // main_done channel is closed
                     if wait_for == parallel {
-                        close(overview_input_channel)
-                        log.Printf("main: closed overview_input_channel")
+                        close(overview.Overview.OVIC)
+                        log.Printf("main: closed overview_input_channel overview.Overview.OVIC")
                         break forever
                     } else {
                         log.Printf("ERROR wait_for=%d != parallel=%d", wait_for, parallel)
@@ -87,16 +97,16 @@ func main() {
 
     wait_closing:
     for {
-        len_ovi := len(overview_input_channel)
+        len_ovi := len(overview.Overview.OVIC)
         if len_ovi == 0 {
-            log.Printf("main: close(overview_input_channel)")
+            log.Printf("main: close(overview.Overview.OVIC)")
             close_server("main()")
             break wait_closing
         }
-        log.Printf("main: waiting overview_input_channel=%d", len_ovi)
+        log.Printf("main: waiting overview.Overview.OVIC=%d", len_ovi)
         time.Sleep(500 * time.Millisecond)
     }
-    overview.Watch_overview_Workers(OVERVIEW_WORKERS, overview_input_channel)
+    overview.Watch_overview_Workers(OVERVIEW_WORKERS)
     close(counter_chan)
     processed := <- processed_chan
     log.Printf("QUIT Overview runtime=%d processed=%d", utils.Now()-start_time, processed)
@@ -144,16 +154,16 @@ func GO_main_test(id int, parallel int, main_done chan bool, test int, test_max 
             ovl.Retchan = make(chan []overview.ReturnChannelData, 1)
 
             if DEBUG {
-                log.Printf("GO_main_test id=%d: overview_input_channel=%d/%d", id, len(overview_input_channel), cap(overview_input_channel))
+                log.Printf("GO_main_test id=%d: overview_input_channel=%d/%d", id, len(overview.Overview.OVIC), cap(overview.Overview.OVIC))
             }
             // pass extracted ovl header values to overview worker
-            overview_input_channel <- ovl
+            overview.Overview.OVIC <- ovl
             // wait for response if overview has been created or not
 
             // the retdata contains multiples: for every newsgroup a msgnum
             retdata := <- ovl.Retchan
             for j, data := range retdata {
-                log.Printf("GO_main_test id=%d: i=%d data[%d]: retbool=%t msgnum=%d newsgroup='%s' msgid='%s'", id, i, j, data.Retbool, data.Msgnum, data.Newsgroup, ovl.Messageid )
+                if DEBUG { log.Printf("GO_main_test id=%d: i=%d data[%d]: retbool=%t msgnum=%d newsgroup='%s' msgid='%s'", id, i, j, data.Retbool, data.Msgnum, data.Newsgroup, ovl.Messageid ) }
                 if data.Retbool {
                     // activemap.upHI(data.Newsgroup) // up the activemap HI value for this group
                 }
@@ -179,21 +189,37 @@ type ARTICLE struct {
     bodysize int
 }
 
+func random_groups(num int, entropy int) string {
+    // generates random groups for Newsgroup: header
+    ng := "Newsgroups: "
+    if num <= 0 {
+        num = NonZeroRandomInt(1, overview.LIMIT_SPLITMAX_NEWSGROUPS+1) // test one more than we allow to trigger split error
+    }
+    for i:=1; i <= num; i++ {
+        fakegroup := randomHex(entropy)
+        ng = ng +fakegroup+","
+    }
+    return ng
+} // end func random_groups
 
 func fake_article(init int, max int) ([]ARTICLE, int) {
     var articles []ARTICLE
     bef := "test"
     done := 0
-    for i := init; i <= init+max*4; i+=4 {
+    entropy := 2    // results in random groups: 16^entropy and this many overview files!!
+                    // great to test concurrency of opening and closing loads of mmaps
+                    //  16^2 = 256, 16^3 = 4096, 16^4 = 65k, 16^5 = 1M, 16^6 = 16M
+    for i := init; i <= max; i++ {
         var article ARTICLE
         c := randomChars(4)
         from := "From: from="+c+"@"+c+" ("+c+")"
         subj := "Subject: subject="+c+c+c+c
-        date := fmt.Sprintf("Date: 29 Feb %d 00:00:00 UTC", i)
+        date := fmt.Sprintf("Date: %s", get_uniq_date())
         msgid := "Message-ID: <"+c+"@"+c+".com>"
         ref := "References: <"+bef+"@"+bef+".com>"
         bef = c
-        ng :=  "Newsgroups: ab.test,ab.test1 , ab.test2 ,ab.test3,  ab.test4,ab.test5  ,  ab.test5  ,   ab.test4,ab.test5"
+        ng := random_groups(-1, entropy)
+        //ng :=  "Newsgroups: ab.test,ab.test1 , ab.test2 ,ab.test3,  ab.test4,ab.test5  ,  ab.test5  ,   ab.test4,ab.test5"
         //ng :=  "Newsgroups: ab.test"
         article.head = []string{ ref, date, from, subj, msgid, ng, "", } // order should not matter only the final empty string is important?
         for _, line := range article.head {
@@ -221,17 +247,30 @@ func fake_body() (lines int, size int) {
 
 // generates a random string of fixed size
 func randomChars(size int) string {
-    /*
-    charset := "0123456789abcdef"
+
+    charset := "0123456789abcdefghijklmnopqrstuvwxyz"
     buf := make([]byte, size)
     for i := 0; i < size; i++ {
         //
         buf[i] = charset[rand.Intn(len(charset))]
     }
     return string(buf)
-    */
-    return "abcd"
+
+    //return "abcd"
 } // end func randomChars
+
+func randomHex(size int) string {
+
+    charset := "0123456789abcd"
+    buf := make([]byte, size)
+    for i := 0; i < size; i++ {
+        //
+        buf[i] = charset[rand.Intn(len(charset))]
+    }
+    return string(buf)
+
+    //return "abcd"
+} // end func randomHex
 
 
 func NonZeroRandomInt(a int, b int) int {
@@ -309,3 +348,11 @@ func GO_counter(counter_chan chan uint64, processed_chan chan uint64) {
     processed_chan <- processed
 } // end func GO_counter
 
+
+func get_uniq_date() string {
+    read := <- uniq_date_chan
+    read++
+    uniq_date_chan <- read
+    datestring := fmt.Sprintf("%s", time.Unix(read, 0))
+    return datestring
+}
