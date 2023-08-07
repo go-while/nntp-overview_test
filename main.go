@@ -49,9 +49,9 @@ func main() {
         os.Exit(1)
     }
 
-    test_max := 10000     // generate this many articles per run, higher max will only flood memory with headers
-    parallel := 10      // runs 'N' GO_main_test in parallel
-    test := 100000        // generate this many articles to test creating overviews per go routine
+    test_max := 1     // generate this many articles per run, higher max will only flood memory with headers
+    parallel := 2      // runs 'N' GO_main_test in parallel
+    test := 5       // generate this many articles to test creating overviews per go routine
 
     main_done := make(chan bool, parallel)
     counter_chan := make(chan uint64, parallel)
@@ -64,12 +64,30 @@ func main() {
 
     // Setting up signal capturing SIGINT (kill -2)
     os_stop := make(chan os.Signal, 1)
-    signal.Notify(os_stop, os.Interrupt)
+    log.Printf("go signal.Notify 1")
+    go signal.Notify(os_stop, os.Interrupt)
+    log.Printf("go signal.Notify 2")
 
+	var processed uint64
+	for {
+		select {
+			case processed = <- processed_chan:
+				processed_chan <- processed
+			default:
+		}
+		if processed == uint64(test*parallel) {
+			break
+		}
+
+		time.Sleep(time.Second*1)
+		log.Printf("processed=%d, t=%d", processed, test*parallel)
+	}
     wait_for := 0
     //closed_main := false
     forever:
     for {
+		log.Printf("main: wait forever")
+
         select {
             case <- os_stop:
                 break forever
@@ -85,7 +103,7 @@ func main() {
                 } else
                 if !ok { // main_done channel is closed
                     if wait_for == parallel {
-                        close(overview.Overview.OVIC)
+                        //close(overview.Overview.OVIC)
                         log.Printf("main: closed overview_input_channel overview.Overview.OVIC")
                         break forever
                     } else {
@@ -93,6 +111,7 @@ func main() {
                     }
                 }
         }
+        time.Sleep(time.Second*1)
     }
 
     wait_closing:
@@ -108,7 +127,7 @@ func main() {
     }
     overview.Watch_overview_Workers(OVERVIEW_WORKERS)
     close(counter_chan)
-    processed := <- processed_chan
+
     log.Printf("QUIT Overview runtime=%d processed=%d", utils.Now()-start_time, processed)
 
 } // end func main
@@ -117,7 +136,6 @@ func main() {
 func GO_main_test(id int, parallel int, main_done chan bool, test int, test_max int, counter_chan chan uint64) {
     // testing app integration
     defer done(id, parallel, main_done)
-    init := 1972 // just any year
 
     articles_done, remain := 0, test
 
@@ -133,12 +151,11 @@ func GO_main_test(id int, parallel int, main_done chan bool, test int, test_max 
         if test > test_max { // dont flood the memory
             test = test_max
         }
-        articles, init = fake_article(init, test)  // generate fake articles
+        articles = fake_article(test_max)  // generate fake articles
         remain -= test
         log.Printf("GO_main_test %d id=%d: test %d articles +todo=%d", utils.Nano(), id, len(articles), remain)
 
         for i, article := range articles {  // loop the fake articles
-            count_chan_inc(counter_chan) // count them
 
             ovl := overview.Extract_overview("?", article.head) // pass header to extract_overview and receive an ovl object
 
@@ -170,6 +187,7 @@ func GO_main_test(id int, parallel int, main_done chan bool, test int, test_max 
             }
 
             articles_done++
+            count_chan_inc(counter_chan) // count them
         } // end for range headers
         log.Printf("GO_main_test %d id=%d: tested %d articles remain=%d took=%d ms", utils.Nano(), id, len(articles), remain, utils.UnixTimeMilliSec() - step_timer)
         if remain <= 0 {
@@ -202,14 +220,14 @@ func random_groups(num int, entropy int) string {
     return ng
 } // end func random_groups
 
-func fake_article(init int, max int) ([]ARTICLE, int) {
+func fake_article(max int) ([]ARTICLE) {
     var articles []ARTICLE
     bef := "test"
     done := 0
     entropy := 2    // results in random groups: 16^entropy and this many overview files!!
                     // great to test concurrency of opening and closing loads of mmaps
                     //  16^2 = 256, 16^3 = 4096, 16^4 = 65k, 16^5 = 1M, 16^6 = 16M
-    for i := init; i <= max; i++ {
+    for i := 1; i <= max; i++ {
         var article ARTICLE
         c := randomChars(4)
         from := "From: from="+c+"@"+c+" ("+c+")"
@@ -227,11 +245,12 @@ func fake_article(init int, max int) ([]ARTICLE, int) {
         }
         article.bodylines, article.bodysize = fake_body()
         articles = append(articles, article)
-        init = i
+        //init = i
         done++
         if done >= max { break }
     }
-    return articles, init
+    log.Printf("fake_article articles=%d", len(articles))
+    return articles
 } // end func fake_article
 
 
@@ -289,16 +308,8 @@ func done(id int, parallel int, main_done chan bool) {
 
 func count_chan_inc(counter_chan chan uint64) {
     counter_chan <- 1
+	log.Printf("count_chan_inc passed")
 } // end func count_chan_inc
-
-
-func count_chan_get(counter_chan chan uint64) uint64 {
-    log.Printf("counter_chan_get counter_chan=%d", len(counter_chan))
-    value := <- counter_chan
-    counter_chan <- value
-    log.Printf("counter_chan_get value=%d", value)
-    return value
-} // end func count_chan_get
 
 
 func close_server(src string) {
@@ -331,21 +342,25 @@ func is_closed_server() bool {
 
 func GO_counter(counter_chan chan uint64, processed_chan chan uint64) {
     processed := <- counter_chan
+    processed_chan <- processed
     log.Printf("Boot GO_Counter: processed=%d counter_chan=%d/%d", processed, len(counter_chan), cap(counter_chan))
     for_counter:
     for {
         select {
             case count, ok := <- counter_chan:
+                log.Printf("GO_Counter: processed=%d count=%d", processed, count)
                 if !ok {
                     break for_counter
                 }
                 if count > 0 {
-                    processed += count
+					processed = <- processed_chan // read value
+                    processed += count // update value
+                    processed_chan <- processed // park value
+                    log.Printf("GO_Counter: processed=%d counter_chan=%d/%d", processed, len(counter_chan), cap(counter_chan))
                 }
         }
     }
     log.Printf("GO_counter: processed=%d", processed)
-    processed_chan <- processed
 } // end func GO_counter
 
 
