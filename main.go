@@ -49,9 +49,9 @@ func main() {
         os.Exit(1)
     }
 
-    test_max := 1     // generate this many articles per run, higher max will only flood memory with headers
-    parallel := 2      // runs 'N' GO_main_test in parallel
-    test := 5       // generate this many articles to test creating overviews per go routine
+    test_max := 1000     // generate this many articles per run, higher max will only flood memory with headers
+    parallel := 4      // runs 'N' GO_main_test in parallel
+    test := 500000       // generate this many articles to test creating overviews per go routine
 
     main_done := make(chan bool, parallel)
     counter_chan := make(chan uint64, parallel)
@@ -168,7 +168,7 @@ func GO_main_test(id int, parallel int, main_done chan bool, test int, test_max 
             ovl.Bytes = article.headsize+article.bodysize
             ovl.Lines = article.bodylines
             ovl.ReaderCachedir = OVERVIEW_DIR // where to place overview files
-            ovl.Retchan = make(chan []overview.ReturnChannelData, 1)
+            ovl.Retchan = make(chan []*overview.ReturnChannelData, 1)
 
             if DEBUG {
                 log.Printf("GO_main_test id=%d: overview_input_channel=%d/%d", id, len(overview.Overview.OVIC), cap(overview.Overview.OVIC))
